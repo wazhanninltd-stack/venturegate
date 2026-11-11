@@ -1,877 +1,1276 @@
-/* VENTUREGATE PRODUCTIONS — CINEMA PLAYER
-   Custom cinematic player with Mux HLS support.
-*/
+/* ============================================================
+   VENTUREGATE PRODUCTIONS
+   Centralised Supabase catalogue + secure admin + cinema player
+   ============================================================ */
 
-const starterFilms = [
-  {id:'vg-001',title:'The Last Light',category:'Short Film',year:'2026',runtime:'14 min',description:'A quiet, atmospheric story about the choices that stay with us long after the moment has passed.',poster:'',video:'',featured:true},
-  {id:'vg-002',title:'Behind the Noise',category:'Documentary',year:'2026',runtime:'32 min',description:'An independent documentary exploring the people, places and stories that rarely make the headlines.',poster:'',video:'',featured:false},
-  {id:'vg-003',title:'Craicademia',category:'Series',year:'2026',runtime:'6 episodes',description:'A Belfast-set comedy series following a house-share where every plan goes spectacularly sideways.',poster:'',video:'',featured:false},
-  {id:'vg-004',title:'No Victim No Crime',category:'Comedy',year:'2026',runtime:'Coming soon',description:'A darkly comic independent production.',poster:'',video:'',featured:false},
-  {id:'vg-005',title:'The Making Of',category:'Documentary',year:'2026',runtime:'18 min',description:'Step behind the scenes and meet the people bringing independent productions to life.',poster:'',video:'',featured:false},
-  {id:'vg-006',title:'First Frame',category:'Short Film',year:'2026',runtime:'9 min',description:'A showcase slot for emerging filmmakers and original short-form storytelling.',poster:'',video:'',featured:false},
-  {id:'vg-007',title:'After Hours',category:'Drama',year:'2026',runtime:'Coming soon',description:'A new independent drama.',poster:'',video:'',featured:false},
-  {id:'vg-008',title:'Open Call',category:'Short Film',year:'2026',runtime:'Coming soon',description:'A home for new voices, fresh ideas and independent stories.',poster:'',video:'',featured:false}
-];
+(() => {
+  "use strict";
 
-let films = loadFilms();
-let activeFilter = 'All';
-let currentHls = null;
-let hideControlsTimer = null;
+  const SUPABASE_CDN =
+    "https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js";
 
-const $ = s => document.querySelector(s);
+  const HLS_CDN =
+    "https://cdn.jsdelivr.net/npm/hls.js@latest/dist/hls.min.js";
 
-function loadFilms() {
-  try {
-    const saved = localStorage.getItem('venturegate_films');
-    return saved ? JSON.parse(saved) : starterFilms;
-  } catch {
-    return starterFilms;
-  }
-}
+  let db = null;
+  let currentUser = null;
+  let isAdmin = false;
+  let films = [];
+  let categories = [];
+  let hlsInstance = null;
+  let currentVideo = null;
 
-function saveFilms() {
-  localStorage.setItem('venturegate_films', JSON.stringify(films));
-}
+  const $ = (selector) => document.querySelector(selector);
 
-function esc(v = '') {
-  return String(v).replace(/[&<>"']/g, c => ({
-    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
-  }[c]));
-}
+  const wait = (ms) =>
+    new Promise((resolve) => setTimeout(resolve, ms));
 
-function toast(msg) {
-  const el = $('#toast');
-  if (!el) return;
-  el.textContent = msg;
-  el.classList.add('show');
-  clearTimeout(window.vgToastTimer);
-  window.vgToastTimer = setTimeout(() => el.classList.remove('show'), 3000);
-}
-
-function renderFilms() {
-  const query = ($('#searchInput')?.value || '').trim().toLowerCase();
-
-  const list = films.filter(f =>
-    (activeFilter === 'All' || f.category === activeFilter) &&
-    (`${f.title} ${f.category} ${f.description}`).toLowerCase().includes(query)
-  );
-
-  $('#filmGrid').innerHTML = list.map(f => `
-    <article class="film-card" data-id="${esc(f.id)}">
-      <div class="poster">
-        ${f.poster
-          ? `<img src="${esc(f.poster)}" alt="${esc(f.title)} poster" onerror="this.remove()">`
-          : `<div class="poster-fallback">${esc((f.title || 'V').slice(0,1))}</div>`}
-        <span class="poster-tag">${esc((f.category || 'FILM').toUpperCase())}</span>
-        <div class="play-overlay"><span>▶</span></div>
-      </div>
-      <div class="film-info">
-        <h3>${esc(f.title)}</h3>
-        <p>${esc(f.year || '2026')} <span>•</span> ${esc(f.runtime || 'Independent film')}</p>
-      </div>
-    </article>
-  `).join('');
-
-  $('#emptyState')?.classList.toggle('hidden', list.length > 0);
-
-  document.querySelectorAll('.film-card').forEach(card => {
-    card.addEventListener('click', () => openFilm(card.dataset.id));
-  });
-}
-
-/* CINEMATIC PLAYER STYLING */
-
-(function addCinemaStyles() {
-  if (document.getElementById('vgCinemaStyles')) return;
-
-  const style = document.createElement('style');
-  style.id = 'vgCinemaStyles';
-
-  style.textContent = `
-    .player-card {
-      width:min(1120px,96vw)!important;
-      background:#080706!important;
-      border:1px solid rgba(229,138,53,.35)!important;
-      overflow:hidden;
-    }
-
-    .player-area {
-      display:block!important;
-      position:relative;
-      width:100%;
-      aspect-ratio:16/9;
-      background:#000;
-      overflow:hidden;
-    }
-
-    .vg-player {
-      position:absolute;
-      inset:0;
-      background:#000;
-      color:#fff;
-      font-family:Arial,sans-serif;
-      overflow:hidden;
-      isolation:isolate;
-    }
-
-    .vg-player video {
-      display:block;
-      width:100%;
-      height:100%;
-      object-fit:contain;
-      background:#000;
-      outline:none;
-    }
-
-    .vg-player .vg-shade {
-      position:absolute;
-      inset:0;
-      z-index:2;
-      display:flex;
-      flex-direction:column;
-      justify-content:space-between;
-      padding:22px 25px 18px;
-      background:linear-gradient(
-        180deg,
-        rgba(0,0,0,.62),
-        transparent 24%,
-        transparent 60%,
-        rgba(0,0,0,.78)
+  function loadScript(src) {
+    return new Promise((resolve, reject) => {
+      const existing = [...document.scripts].find(
+        (script) => script.src === src
       );
-      opacity:1;
-      transition:opacity .35s;
-      pointer-events:none;
-    }
 
-    .vg-player.vg-idle .vg-shade {
-      opacity:0;
-    }
-
-    .vg-player .vg-topline {
-      display:flex;
-      justify-content:space-between;
-      align-items:center;
-      gap:12px;
-    }
-
-    .vg-player .vg-brand {
-      font-size:10px;
-      letter-spacing:3px;
-      color:#ffbd70;
-      font-weight:700;
-      text-transform:uppercase;
-    }
-
-    .vg-player .vg-title {
-      font-size:13px;
-      color:#fff;
-      text-shadow:0 1px 5px #000;
-    }
-
-    .vg-player .vg-bottom {
-      pointer-events:auto;
-    }
-
-    .vg-player .vg-seek {
-      width:100%;
-      height:5px;
-      display:block;
-      appearance:none;
-      border-radius:8px;
-      outline:none;
-      cursor:pointer;
-      background:linear-gradient(
-        to right,
-        #e58a35 0%,
-        #e58a35 var(--vg-progress,0%),
-        rgba(255,255,255,.38) var(--vg-progress,0%),
-        rgba(255,255,255,.38) 100%
-      );
-      margin:0 0 15px;
-    }
-
-    .vg-player .vg-seek::-webkit-slider-thumb {
-      appearance:none;
-      width:12px;
-      height:12px;
-      border-radius:50%;
-      background:#ffbd70;
-      box-shadow:0 0 10px #e58a35;
-      opacity:0;
-      transition:opacity .2s;
-    }
-
-    .vg-player:hover .vg-seek::-webkit-slider-thumb {
-      opacity:1;
-    }
-
-    .vg-player .vg-controls {
-      display:flex;
-      align-items:center;
-      gap:13px;
-    }
-
-    .vg-player button,
-    .vg-player select {
-      border:0;
-      background:transparent;
-      color:#fff;
-      cursor:pointer;
-    }
-
-    .vg-player button {
-      font-size:19px;
-      padding:5px 7px;
-      text-shadow:0 1px 5px #000;
-    }
-
-    .vg-player button:hover {
-      color:#ffbd70;
-    }
-
-    .vg-player .vg-mainplay {
-      width:38px;
-      height:38px;
-      border:1px solid #e58a35;
-      border-radius:50%;
-      color:#ffbd70;
-      font-size:17px;
-    }
-
-    .vg-player .vg-time {
-      font-size:11px;
-      color:#eee;
-      white-space:nowrap;
-      font-variant-numeric:tabular-nums;
-    }
-
-    .vg-player .vg-spacer {
-      flex:1;
-    }
-
-    .vg-player .vg-volume {
-      width:78px;
-      accent-color:#e58a35;
-    }
-
-    .vg-player .vg-speed {
-      font-size:11px;
-      background:#17100d;
-      border:1px solid #9b5b31;
-      border-radius:3px;
-      padding:6px;
-    }
-
-    .vg-player .vg-centerplay {
-      position:absolute;
-      z-index:3;
-      left:50%;
-      top:50%;
-      transform:translate(-50%,-50%);
-      width:68px;
-      height:68px;
-      border:1px solid rgba(255,189,112,.8);
-      border-radius:50%;
-      background:rgba(10,7,5,.55);
-      color:#ffbd70;
-      font-size:25px;
-      opacity:0;
-      transition:opacity .2s;
-      pointer-events:none;
-    }
-
-    .vg-player.vg-paused .vg-centerplay {
-      opacity:1;
-    }
-
-    .vg-player .vg-loading {
-      position:absolute;
-      z-index:4;
-      left:50%;
-      top:50%;
-      transform:translate(-50%,-50%);
-      width:42px;
-      height:42px;
-      border:3px solid #ffffff30;
-      border-top-color:#e58a35;
-      border-radius:50%;
-      animation:vgspin .8s linear infinite;
-      display:none;
-    }
-
-    .vg-player.vg-waiting .vg-loading {
-      display:block;
-    }
-
-    @keyframes vgspin {
-      to {
-        transform:translate(-50%,-50%) rotate(360deg);
-      }
-    }
-
-    .vg-player .vg-error {
-      position:absolute;
-      z-index:5;
-      inset:0;
-      display:none;
-      place-items:center;
-      padding:25px;
-      text-align:center;
-      background:#080706;
-      color:#ffbd70;
-      font-size:13px;
-    }
-
-    .vg-player.vg-failed .vg-error {
-      display:grid;
-    }
-
-    @media(max-width:650px) {
-      .vg-player .vg-shade {padding:12px}
-      .vg-player .vg-title {font-size:11px}
-      .vg-player .vg-controls {gap:5px}
-      .vg-player button {font-size:16px;padding:4px}
-      .vg-player .vg-volume {width:48px}
-      .vg-player .vg-time {font-size:9px}
-      .vg-player .vg-mainplay {width:32px;height:32px}
-    }
-  `;
-
-  document.head.appendChild(style);
-})();
-
-/* PLAYER MANAGEMENT */
-
-function clearPlayer() {
-  clearTimeout(hideControlsTimer);
-
-  if (currentHls) {
-    try {
-      currentHls.destroy();
-    } catch {}
-    currentHls = null;
-  }
-
-  const oldVideo = $('#playerArea video');
-
-  if (oldVideo) {
-    try {
-      oldVideo.pause();
-      oldVideo.removeAttribute('src');
-      oldVideo.load();
-    } catch {}
-  }
-}
-
-function formatTime(seconds) {
-  if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
-
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.floor(seconds % 60).toString().padStart(2,'0');
-
-  return h
-    ? `${h}:${String(m).padStart(2,'0')}:${s}`
-    : `${m}:${s}`;
-}
-
-function loadHlsLibrary(callback) {
-  if (window.Hls) {
-    callback();
-    return;
-  }
-
-  if (window.vgHlsLoading) {
-    window.vgHlsLoading.push(callback);
-    return;
-  }
-
-  window.vgHlsLoading = [callback];
-
-  const script = document.createElement('script');
-  script.src = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.18/dist/hls.min.js';
-
-  script.onload = () => {
-    const queue = window.vgHlsLoading || [];
-    window.vgHlsLoading = null;
-    queue.forEach(fn => fn());
-  };
-
-  script.onerror = () => {
-    window.vgHlsLoading = null;
-    toast('The streaming player could not load. Please refresh and try again.');
-  };
-
-  document.head.appendChild(script);
-}
-
-function buildCinemaPlayer(title, source) {
-  clearPlayer();
-
-  const area = $('#playerArea');
-
-  area.innerHTML = `
-    <div class="vg-player vg-paused" tabindex="0" aria-label="VentureGate cinema player">
-
-      <video playsinline preload="metadata"></video>
-
-      <button class="vg-centerplay" type="button" aria-label="Play">▶</button>
-
-      <div class="vg-loading"></div>
-
-      <div class="vg-error">
-        This video could not be played. Please check the video link and try again.
-      </div>
-
-      <div class="vg-shade">
-
-        <div class="vg-topline">
-          <span class="vg-brand">VENTUREGATE CINEMA</span>
-          <span class="vg-title">${esc(title)}</span>
-        </div>
-
-        <div class="vg-bottom">
-
-          <input class="vg-seek" type="range" min="0" max="1000" value="0" aria-label="Seek video">
-
-          <div class="vg-controls">
-
-            <button class="vg-mainplay" type="button" aria-label="Play">▶</button>
-
-            <button class="vg-back" type="button" aria-label="Back 10 seconds">↶10</button>
-
-            <button class="vg-forward" type="button" aria-label="Forward 10 seconds">10↷</button>
-
-            <span class="vg-time">0:00 / 0:00</span>
-
-            <span class="vg-spacer"></span>
-
-            <button class="vg-mute" type="button" aria-label="Mute">🔊</button>
-
-            <input class="vg-volume" type="range" min="0" max="1" step="0.05" value="1" aria-label="Volume">
-
-            <select class="vg-speed" aria-label="Playback speed">
-              <option value="1">1×</option>
-              <option value="1.25">1.25×</option>
-              <option value="1.5">1.5×</option>
-              <option value="1.75">1.75×</option>
-              <option value="2">2×</option>
-            </select>
-
-            <button class="vg-full" type="button" aria-label="Fullscreen">⛶</button>
-
-          </div>
-        </div>
-      </div>
-    </div>
-  `;
-
-  const player = area.querySelector('.vg-player');
-  const video = player.querySelector('video');
-  const playBtn = player.querySelector('.vg-mainplay');
-  const centerBtn = player.querySelector('.vg-centerplay');
-  const seek = player.querySelector('.vg-seek');
-  const time = player.querySelector('.vg-time');
-  const volume = player.querySelector('.vg-volume');
-  const mute = player.querySelector('.vg-mute');
-
-  function updatePlay() {
-    const paused = video.paused;
-
-    player.classList.toggle('vg-paused', paused);
-
-    playBtn.textContent = paused ? '▶' : 'Ⅱ';
-    playBtn.setAttribute('aria-label', paused ? 'Play' : 'Pause');
-  }
-
-  function togglePlay() {
-    if (video.paused) {
-      video.play().catch(() => toast('Press play again to start the video.'));
-    } else {
-      video.pause();
-    }
-  }
-
-  function showControls() {
-    player.classList.remove('vg-idle');
-    clearTimeout(hideControlsTimer);
-
-    if (!video.paused) {
-      hideControlsTimer = setTimeout(() => {
-        player.classList.add('vg-idle');
-      }, 2400);
-    }
-  }
-
-  function updateProgress() {
-    const duration = video.duration || 0;
-    const current = video.currentTime || 0;
-    const pct = duration ? (current / duration) * 100 : 0;
-
-    seek.value = duration
-      ? Math.round((current / duration) * 1000)
-      : 0;
-
-    seek.style.setProperty('--vg-progress', `${pct}%`);
-
-    time.textContent = `${formatTime(current)} / ${formatTime(duration)}`;
-  }
-
-  playBtn.addEventListener('click', togglePlay);
-  centerBtn.addEventListener('click', togglePlay);
-  video.addEventListener('click', togglePlay);
-
-  player.querySelector('.vg-back').addEventListener('click', () => {
-    video.currentTime = Math.max(0, video.currentTime - 10);
-  });
-
-  player.querySelector('.vg-forward').addEventListener('click', () => {
-    video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 10);
-  });
-
-  seek.addEventListener('input', () => {
-    if (video.duration) {
-      video.currentTime = (Number(seek.value) / 1000) * video.duration;
-    }
-  });
-
-  volume.addEventListener('input', () => {
-    video.volume = Number(volume.value);
-    video.muted = video.volume === 0;
-    mute.textContent = video.muted ? '🔇' : '🔊';
-  });
-
-  mute.addEventListener('click', () => {
-    video.muted = !video.muted;
-    mute.textContent = video.muted ? '🔇' : '🔊';
-  });
-
-  player.querySelector('.vg-speed').addEventListener('change', e => {
-    video.playbackRate = Number(e.target.value);
-  });
-
-  player.querySelector('.vg-full').addEventListener('click', () => {
-    if (document.fullscreenElement) {
-      document.exitFullscreen?.();
-    } else {
-      player.requestFullscreen?.();
-    }
-  });
-
-  player.addEventListener('mousemove', showControls);
-  player.addEventListener('touchstart', showControls, {passive:true});
-
-  player.addEventListener('mouseleave', () => {
-    if (!video.paused) {
-      player.classList.add('vg-idle');
-    }
-  });
-
-  player.addEventListener('keydown', e => {
-    if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
-
-    if (e.code === 'Space') {
-      e.preventDefault();
-      togglePlay();
-    }
-
-    if (e.code === 'ArrowLeft') {
-      video.currentTime = Math.max(0, video.currentTime - 10);
-    }
-
-    if (e.code === 'ArrowRight') {
-      video.currentTime = Math.min(video.duration || Infinity, video.currentTime + 10);
-    }
-
-    showControls();
-  });
-
-  video.addEventListener('play', updatePlay);
-
-  video.addEventListener('pause', () => {
-    updatePlay();
-    player.classList.remove('vg-idle');
-  });
-
-  video.addEventListener('timeupdate', updateProgress);
-  video.addEventListener('loadedmetadata', updateProgress);
-
-  video.addEventListener('waiting', () => {
-    player.classList.add('vg-waiting');
-  });
-
-  video.addEventListener('playing', () => {
-    player.classList.remove('vg-waiting');
-  });
-
-  video.addEventListener('canplay', () => {
-    player.classList.remove('vg-waiting');
-  });
-
-  video.addEventListener('error', () => {
-    player.classList.add('vg-failed');
-  });
-
-  const isHls = /\.m3u8($|\?)/i.test(source) || /stream\.mux\.com/i.test(source);
-
-  if (isHls && video.canPlayType('application/vnd.apple.mpegurl')) {
-
-    // Safari supports HLS natively.
-    video.src = source;
-    video.play().catch(() => {});
-
-  } else if (isHls) {
-
-    // Chrome and Edge use hls.js.
-    loadHlsLibrary(() => {
-
-      if (!window.Hls || !window.Hls.isSupported()) {
-        player.classList.add('vg-failed');
+      if (existing) {
+        if (existing.dataset.loaded === "true") {
+          resolve();
+          return;
+        }
+
+        existing.addEventListener("load", resolve, { once: true });
+        existing.addEventListener("error", reject, { once: true });
         return;
       }
 
-      currentHls = new window.Hls({
-        enableWorker:true
-      });
+      const script = document.createElement("script");
+      script.src = src;
+      script.async = true;
 
-      currentHls.loadSource(source);
-      currentHls.attachMedia(video);
+      script.onload = () => {
+        script.dataset.loaded = "true";
+        resolve();
+      };
 
-      currentHls.on(window.Hls.Events.MANIFEST_PARSED, () => {
-        video.play().catch(() => {});
-      });
+      script.onerror = reject;
 
-      currentHls.on(window.Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
-            currentHls.startLoad();
-          } else if (data.type === window.Hls.ErrorTypes.MEDIA_ERROR) {
-            currentHls.recoverMediaError();
-          } else {
-            player.classList.add('vg-failed');
+      document.head.appendChild(script);
+    });
+  }
+
+  async function initialise() {
+    try {
+      await loadScript(
+        "https://wazhanninltd-stack.github.io/venturegate/config.js"
+      );
+
+      if (
+        !window.VENTUREGATE_SUPABASE_URL ||
+        !window.VENTUREGATE_SUPABASE_KEY
+      ) {
+        throw new Error(
+          "Supabase configuration could not be loaded."
+        );
+      }
+
+      await loadScript(SUPABASE_CDN);
+
+      if (!window.supabase?.createClient) {
+        throw new Error("Supabase library failed to load.");
+      }
+
+      db = window.supabase.createClient(
+        window.VENTUREGATE_SUPABASE_URL,
+        window.VENTUREGATE_SUPABASE_KEY,
+        {
+          auth: {
+            persistSession: true,
+            autoRefreshToken: true,
+            detectSessionInUrl: true
           }
+        }
+      );
+
+      await loadScript(HLS_CDN);
+
+      installStyles();
+      installAdminInterface();
+      installPlayerInterface();
+
+      const {
+        data: { session }
+      } = await db.auth.getSession();
+
+      if (session?.user) {
+        await checkAdmin(session.user);
+      }
+
+      db.auth.onAuthStateChange(async (event, session) => {
+        if (event === "SIGNED_OUT" || !session?.user) {
+          currentUser = null;
+          isAdmin = false;
+          updateAdminInterface();
+        }
+
+        if (event === "SIGNED_IN" && session?.user) {
+          await checkAdmin(session.user);
         }
       });
 
-    });
+      await loadCatalogue();
 
-  } else {
+    } catch (error) {
+      console.error("VentureGate initialisation:", error);
 
-    video.src = source;
-    video.play().catch(() => {});
-
+      showToast(
+        "Website connection error. Please refresh the page."
+      );
+    }
   }
 
-  showControls();
-}
+  /* ============================================================
+     STYLES
+     ============================================================ */
 
-/* FILM DETAILS AND MODALS */
+  function installStyles() {
+    if ($("#vg-dynamic-styles")) return;
 
-function openFilm(id) {
-  const f = films.find(x => x.id === id);
+    const style = document.createElement("style");
+    style.id = "vg-dynamic-styles";
 
-  if (!f) return;
-
-  $('#modalCategory').textContent = (f.category || 'FILM').toUpperCase();
-  $('#modalTitle').textContent = f.title;
-  $('#modalDescription').textContent = f.description;
-  $('#modalMeta').textContent = `${f.year || ''} • ${f.runtime || 'Independent film'}`;
-
-  const area = $('#playerArea');
-  area.innerHTML = '';
-
-  if (f.video) {
-
-    if (/youtube\.com|youtu\.be|vimeo\.com/i.test(f.video)) {
-
-      let url = f.video;
-
-      if (url.includes('watch?v=')) {
-        url = url.replace('watch?v=', 'embed/');
-      } else if (url.includes('youtu.be/')) {
-        url = url.replace('youtu.be/', 'www.youtube.com/embed/');
+    style.textContent = `
+      .vg-login-box {
+        padding: 20px;
+        border: 1px solid rgba(255,255,255,.12);
+        border-radius: 12px;
+        margin-bottom: 20px;
+        background: rgba(255,255,255,.025);
       }
 
-      area.innerHTML = `
-        <iframe
-          src="${esc(url)}"
-          allow="autoplay; fullscreen; picture-in-picture"
-          allowfullscreen
-          title="${esc(f.title)}">
-        </iframe>
+      .vg-login-box input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 13px;
+        margin: 7px 0;
+        background: #111;
+        border: 1px solid #444;
+        border-radius: 6px;
+        color: white;
+      }
+
+      .vg-admin-status {
+        padding: 12px;
+        margin-bottom: 15px;
+        border-radius: 7px;
+        background: rgba(255,255,255,.06);
+      }
+
+      .vg-admin-status.success {
+        border-left: 3px solid #e66b2e;
+      }
+
+      .vg-player {
+        position: relative;
+        width: 100%;
+        background: #000;
+        overflow: hidden;
+        border-radius: 8px;
+        aspect-ratio: 16 / 9;
+      }
+
+      .vg-player video {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        background: #000;
+      }
+
+      .vg-controls {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        justify-content: space-between;
+        padding: 18px;
+        box-sizing: border-box;
+        background: linear-gradient(
+          to bottom,
+          rgba(0,0,0,.55),
+          transparent 25%,
+          transparent 60%,
+          rgba(0,0,0,.8)
+        );
+        opacity: 1;
+        transition: opacity .35s ease;
+        pointer-events: none;
+      }
+
+      .vg-player.vg-hidden-controls .vg-controls {
+        opacity: 0;
+      }
+
+      .vg-controls button,
+      .vg-controls input {
+        pointer-events: auto;
+      }
+
+      .vg-control-top,
+      .vg-control-bottom,
+      .vg-control-centre {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+
+      .vg-control-centre {
+        justify-content: center;
+      }
+
+      .vg-controls button {
+        background: rgba(20,20,20,.78);
+        color: white;
+        border: 1px solid rgba(255,255,255,.2);
+        border-radius: 50%;
+        width: 42px;
+        height: 42px;
+        cursor: pointer;
+        font-size: 17px;
+      }
+
+      .vg-controls button:hover {
+        background: #df682d;
+      }
+
+      .vg-play-main {
+        width: 64px !important;
+        height: 64px !important;
+        font-size: 25px !important;
+      }
+
+      .vg-progress {
+        width: 100%;
+        accent-color: #ed7134;
+        cursor: pointer;
+      }
+
+      .vg-time {
+        color: white;
+        font-size: 12px;
+        white-space: nowrap;
+      }
+
+      .vg-volume {
+        width: 75px;
+        accent-color: #ed7134;
+      }
+
+      .vg-film-card {
+        cursor: pointer;
+        transition: transform .25s ease;
+      }
+
+      .vg-film-card:hover {
+        transform: translateY(-5px);
+      }
+
+      .vg-film-poster {
+        width: 100%;
+        aspect-ratio: 2 / 3;
+        object-fit: cover;
+        background: #171717;
+        display: block;
+      }
+
+      .vg-film-placeholder {
+        aspect-ratio: 2 / 3;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(145deg,#222,#090909);
+        color: #df7138;
+        font-size: 30px;
+      }
+
+      .vg-admin-actions {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+
+      .vg-delete-button {
+        background: #842d2d;
+        color: white;
+        border: 0;
+        border-radius: 5px;
+        padding: 8px 12px;
+        cursor: pointer;
+      }
+
+      .vg-muted {
+        color: #aaa;
+        font-size: 13px;
+      }
+
+      .vg-player-error {
+        color: white;
+        padding: 25px;
+        text-align: center;
+      }
+
+      @media(max-width:600px) {
+        .vg-controls {
+          padding: 10px;
+        }
+
+        .vg-controls button {
+          width: 36px;
+          height: 36px;
+        }
+
+        .vg-volume {
+          width: 50px;
+        }
+      }
+    `;
+
+    document.head.appendChild(style);
+  }
+
+  /* ============================================================
+     NOTIFICATIONS
+     ============================================================ */
+
+  function showToast(message) {
+    const toast = $("#toast");
+
+    if (toast) {
+      toast.textContent = message;
+      toast.classList.add("show");
+
+      clearTimeout(toast._vgTimer);
+
+      toast._vgTimer = setTimeout(() => {
+        toast.classList.remove("show");
+      }, 3500);
+    } else {
+      console.log("VentureGate:", message);
+    }
+  }
+
+  /* ============================================================
+     CATALOGUE
+     ============================================================ */
+
+  async function loadCatalogue() {
+    try {
+      const [filmResult, categoryResult] = await Promise.all([
+        db
+          .from("films")
+          .select("*")
+          .eq("published", true)
+          .order("created_at", { ascending: false }),
+
+        db
+          .from("categories")
+          .select("*")
+          .order("name")
+      ]);
+
+      if (filmResult.error) throw filmResult.error;
+      if (categoryResult.error) throw categoryResult.error;
+
+      films = filmResult.data || [];
+      categories = categoryResult.data || [];
+
+      renderFilms();
+      renderFilters();
+      renderAdminFilms();
+
+      console.log(
+        `VentureGate loaded ${films.length} published films.`
+      );
+
+    } catch (error) {
+      console.error("Catalogue error:", error);
+
+      showToast(
+        "Could not load the film catalogue. Check your Supabase permissions."
+      );
+    }
+  }
+
+  function categoryName(categoryId) {
+    const category = categories.find(
+      (item) => String(item.id) === String(categoryId)
+    );
+
+    return category?.name || "Film";
+  }
+
+  function renderFilms() {
+    const grid = $("#filmGrid");
+    if (!grid) return;
+
+    const search = ($("#searchInput")?.value || "")
+      .trim()
+      .toLowerCase();
+
+    const activeFilter =
+      document.querySelector("#filters .active")?.dataset.category ||
+      document.querySelector("#filters [aria-pressed='true']")?.dataset.category ||
+      "all";
+
+    const filtered = films.filter((film) => {
+      const matchesSearch =
+        (film.title || "").toLowerCase().includes(search) ||
+        (film.description || "").toLowerCase().includes(search);
+
+      const matchesCategory =
+        activeFilter === "all" ||
+        categoryName(film.category_id).toLowerCase() ===
+          activeFilter.toLowerCase();
+
+      return matchesSearch && matchesCategory;
+    });
+
+    grid.innerHTML = "";
+
+    filtered.forEach((film) => {
+      const card = document.createElement("article");
+
+      card.className = "vg-film-card film-card";
+
+      const poster = film.poster_url
+        ? `<img class="vg-film-poster" src="${escapeHTML(
+            film.poster_url
+          )}" alt="${escapeHTML(film.title)}" loading="lazy">`
+        : `<div class="vg-film-placeholder">VG</div>`;
+
+      card.innerHTML = `
+        ${poster}
+        <div class="film-card-info">
+          <h3>${escapeHTML(film.title)}</h3>
+          <p>${escapeHTML(categoryName(film.category_id))}</p>
+          <span class="vg-muted">
+            ${escapeHTML(film.release_year || "")}
+            ${film.duration ? " • " + escapeHTML(film.duration) : ""}
+          </span>
+        </div>
       `;
 
-    } else {
+      card.addEventListener("click", () => openFilm(film));
 
-      buildCinemaPlayer(f.title, f.video);
+      grid.appendChild(card);
+    });
 
+    const empty = $("#emptyState");
+
+    if (empty) {
+      empty.style.display = filtered.length ? "none" : "block";
+    }
+  }
+
+  function renderFilters() {
+    const filters = $("#filters");
+    if (!filters) return;
+
+    filters.innerHTML = "";
+
+    const all = document.createElement("button");
+    all.textContent = "All";
+    all.dataset.category = "all";
+    all.className = "active";
+    filters.appendChild(all);
+
+    categories.forEach((category) => {
+      const button = document.createElement("button");
+
+      button.textContent = category.name;
+      button.dataset.category = category.name;
+
+      filters.appendChild(button);
+    });
+
+    filters.querySelectorAll("button").forEach((button) => {
+      button.addEventListener("click", () => {
+        filters.querySelectorAll("button").forEach((item) => {
+          item.classList.remove("active");
+        });
+
+        button.classList.add("active");
+        renderFilms();
+      });
+    });
+  }
+
+  function escapeHTML(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (character) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#039;"
+    })[character]);
+  }
+
+  /* ============================================================
+     FILM MODAL
+     ============================================================ */
+
+  function openFilm(film) {
+    const modal = $("#filmModal");
+
+    if (!modal) {
+      console.error("Film modal not found.");
+      return;
     }
 
-  } else {
+    currentVideo = film;
+
+    if ($("#modalTitle")) {
+      $("#modalTitle").textContent = film.title || "";
+    }
+
+    if ($("#modalCategory")) {
+      $("#modalCategory").textContent =
+        categoryName(film.category_id);
+    }
+
+    if ($("#modalDescription")) {
+      $("#modalDescription").textContent =
+        film.description || "";
+    }
+
+    if ($("#modalMeta")) {
+      $("#modalMeta").textContent = [
+        film.release_year,
+        film.duration
+      ].filter(Boolean).join(" • ");
+    }
+
+    showModal(modal);
+
+    createPlayer(film.video_url);
+  }
+
+  function showModal(modal) {
+    modal.classList.add("active", "open");
+    modal.style.display = "flex";
+    document.body.style.overflow = "hidden";
+  }
+
+  function closeModal(modal) {
+    if (!modal) return;
+
+    modal.classList.remove("active", "open");
+    modal.style.display = "none";
+
+    if (!document.querySelector(".modal.active, .modal.open")) {
+      document.body.style.overflow = "";
+    }
+  }
+
+  /* ============================================================
+     CINEMA PLAYER
+     ============================================================ */
+
+  function installPlayerInterface() {
+    const modal = $("#filmModal");
+
+    if (!modal) return;
+
+    modal.querySelectorAll("[data-close], .modal-close").forEach(
+      (button) => {
+        button.addEventListener("click", () => {
+          destroyPlayer();
+          closeModal(modal);
+        });
+      }
+    );
+
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) {
+        destroyPlayer();
+        closeModal(modal);
+      }
+    });
+  }
+
+  function destroyPlayer() {
+    if (hlsInstance) {
+      hlsInstance.destroy();
+      hlsInstance = null;
+    }
+
+    const video = $("#vgVideo");
+
+    if (video) {
+      video.pause();
+      video.removeAttribute("src");
+      video.load();
+    }
+
+    currentVideo = null;
+  }
+
+  function normaliseVideoUrl(url) {
+    if (!url) return "";
+
+    const cleaned = url.trim();
+
+    if (/^[A-Za-z0-9]+$/.test(cleaned)) {
+      return `https://stream.mux.com/${cleaned}.m3u8`;
+    }
+
+    return cleaned;
+  }
+
+  function createPlayer(videoUrl) {
+    const area = $("#playerArea");
+    if (!area) return;
+
+    destroyPlayer();
+
+    const url = normaliseVideoUrl(videoUrl);
+
+    if (!url) {
+      area.innerHTML = `
+        <div class="vg-player-error">
+          <h3>Video unavailable</h3>
+          <p>This film does not have a playback link yet.</p>
+        </div>
+      `;
+      return;
+    }
 
     area.innerHTML = `
-      <div class="player-placeholder">
-        Your film player will appear here once a video URL is added in Studio.
+      <div class="vg-player" id="vgPlayer">
+        <video id="vgVideo" playsinline preload="metadata"></video>
+
+        <div class="vg-controls" id="vgControls">
+
+          <div class="vg-control-top">
+            <span style="color:white;font-weight:600">
+              VENTUREGATE
+            </span>
+            <button type="button" id="vgFullscreen" aria-label="Fullscreen">⛶</button>
+          </div>
+
+          <div class="vg-control-centre">
+            <button type="button" id="vgBack" aria-label="Back 10 seconds">↶</button>
+            <button type="button" id="vgPlay" class="vg-play-main" aria-label="Play">▶</button>
+            <button type="button" id="vgForward" aria-label="Forward 10 seconds">↷</button>
+          </div>
+
+          <div>
+            <input class="vg-progress" id="vgProgress"
+              type="range" min="0" max="100" value="0" step="0.1">
+
+            <div class="vg-control-bottom">
+              <span class="vg-time" id="vgTime">00:00 / 00:00</span>
+
+              <div style="display:flex;align-items:center;gap:8px">
+                <button type="button" id="vgMute" aria-label="Mute">♫</button>
+                <input class="vg-volume" id="vgVolume"
+                  type="range" min="0" max="1" step="0.05" value="1">
+                <button type="button" id="vgSpeed">1×</button>
+              </div>
+            </div>
+          </div>
+
+        </div>
       </div>
     `;
 
+    const video = $("#vgVideo");
+    const player = $("#vgPlayer");
+
+    const playButton = $("#vgPlay");
+    const progress = $("#vgProgress");
+    const time = $("#vgTime");
+    const volume = $("#vgVolume");
+    const speed = $("#vgSpeed");
+
+    let hideTimer;
+    let speedIndex = 0;
+
+    const speeds = [1, 1.25, 1.5, 1.75, 2];
+
+    function formatTime(seconds) {
+      if (!Number.isFinite(seconds)) return "00:00";
+
+      const minutes = Math.floor(seconds / 60);
+      const secs = Math.floor(seconds % 60);
+
+      return `${String(minutes).padStart(2, "0")}:${String(
+        secs
+      ).padStart(2, "0")}`;
+    }
+
+    function updatePlayButton() {
+      playButton.textContent = video.paused ? "▶" : "Ⅱ";
+    }
+
+    function updateProgress() {
+      if (!video.duration) return;
+
+      progress.value =
+        (video.currentTime / video.duration) * 100;
+
+      time.textContent =
+        `${formatTime(video.currentTime)} / ${formatTime(video.duration)}`;
+    }
+
+    function revealControls() {
+      player.classList.remove("vg-hidden-controls");
+
+      clearTimeout(hideTimer);
+
+      if (!video.paused) {
+        hideTimer = setTimeout(() => {
+          player.classList.add("vg-hidden-controls");
+        }, 3000);
+      }
+    }
+
+    playButton.addEventListener("click", () => {
+      if (video.paused) {
+        video.play().catch(() => {
+          showToast("Unable to start video playback.");
+        });
+      } else {
+        video.pause();
+      }
+
+      revealControls();
+    });
+
+    video.addEventListener("click", () => {
+      if (video.paused) {
+        video.play().catch(() => {});
+      } else {
+        video.pause();
+      }
+
+      revealControls();
+    });
+
+    video.addEventListener("play", updatePlayButton);
+    video.addEventListener("pause", updatePlayButton);
+    video.addEventListener("timeupdate", updateProgress);
+    video.addEventListener("loadedmetadata", updateProgress);
+    video.addEventListener("ended", () => {
+      player.classList.remove("vg-hidden-controls");
+      updatePlayButton();
+    });
+
+    $("#vgBack").addEventListener("click", () => {
+      video.currentTime = Math.max(0, video.currentTime - 10);
+      revealControls();
+    });
+
+    $("#vgForward").addEventListener("click", () => {
+      video.currentTime = Math.min(
+        video.duration || 0,
+        video.currentTime + 10
+      );
+      revealControls();
+    });
+
+    progress.addEventListener("input", () => {
+      if (video.duration) {
+        video.currentTime =
+          (Number(progress.value) / 100) * video.duration;
+      }
+    });
+
+    volume.addEventListener("input", () => {
+      video.volume = Number(volume.value);
+      video.muted = video.volume === 0;
+    });
+
+    $("#vgMute").addEventListener("click", () => {
+      video.muted = !video.muted;
+      $("#vgMute").textContent = video.muted ? "×" : "♫";
+    });
+
+    speed.addEventListener("click", () => {
+      speedIndex = (speedIndex + 1) % speeds.length;
+      video.playbackRate = speeds[speedIndex];
+      speed.textContent = `${speeds[speedIndex]}×`;
+      revealControls();
+    });
+
+    $("#vgFullscreen").addEventListener("click", () => {
+      if (player.requestFullscreen) {
+        player.requestFullscreen();
+      } else if (video.webkitEnterFullscreen) {
+        video.webkitEnterFullscreen();
+      }
+    });
+
+    player.addEventListener("mousemove", revealControls);
+    player.addEventListener("touchstart", revealControls);
+
+    player.addEventListener("mouseleave", () => {
+      if (!video.paused) {
+        player.classList.add("vg-hidden-controls");
+      }
+    });
+
+    if (url.endsWith(".m3u8") && window.Hls?.isSupported()) {
+      hlsInstance = new window.Hls();
+
+      hlsInstance.loadSource(url);
+      hlsInstance.attachMedia(video);
+
+      hlsInstance.on(window.Hls.Events.ERROR, (event, data) => {
+        if (data.fatal) {
+          console.error("HLS playback error:", data);
+          showToast("Video playback failed. Please check the Mux link.");
+        }
+      });
+
+    } else if (
+      video.canPlayType("application/vnd.apple.mpegurl")
+    ) {
+      video.src = url;
+
+    } else {
+      video.src = url;
+    }
+
+    video.load();
   }
 
-  showModal('filmModal');
-}
+  /* ============================================================
+     ADMIN AUTHENTICATION
+     ============================================================ */
 
-function showModal(id) {
-  $('#' + id).classList.remove('hidden');
-  document.body.style.overflow = 'hidden';
-}
+  function installAdminInterface() {
+    const modal = $("#adminModal");
+    if (!modal) return;
 
-function hideModal(id) {
-  $('#' + id).classList.add('hidden');
-  document.body.style.overflow = '';
+    const warning = modal.querySelector(".admin-warning");
 
-  if (id === 'filmModal') {
-    clearPlayer();
-    $('#playerArea').innerHTML = '';
+    if (warning) {
+      warning.style.display = "none";
+    }
+
+    let interfaceBox = $("#vgAdminInterface");
+
+    if (!interfaceBox) {
+      interfaceBox = document.createElement("div");
+      interfaceBox.id = "vgAdminInterface";
+
+      modal.prepend(interfaceBox);
+    }
+
+    const adminButton = $("#adminOpen");
+
+    if (adminButton) {
+      adminButton.addEventListener("click", () => {
+        updateAdminInterface();
+        showModal(modal);
+      });
+    }
+
+    modal.querySelectorAll("[data-close], .modal-close").forEach(
+      (button) => {
+        button.addEventListener("click", () => {
+          closeModal(modal);
+        });
+      }
+    );
+
+    modal.addEventListener("click", (event) => {
+      if (event.target === modal) {
+        closeModal(modal);
+      }
+    });
+
+    const form = $("#filmForm");
+
+    if (form) {
+      form.addEventListener("submit", submitFilm);
+    }
+
+    const search = $("#searchInput");
+
+    if (search) {
+      search.addEventListener("input", renderFilms);
+    }
   }
-}
 
-/* CLOSE BUTTONS */
+  async function checkAdmin(user) {
+    currentUser = user;
+    isAdmin = false;
 
-document.querySelectorAll('[data-close]').forEach(b => {
-  b.addEventListener('click', () => hideModal(b.dataset.close));
-});
+    try {
+      const { data, error } = await db
+        .from("profiles")
+        .select("role")
+        .eq("id", user.id)
+        .maybeSingle();
 
-document.querySelectorAll('.modal').forEach(m => {
-  m.addEventListener('click', e => {
-    if (e.target === m) hideModal(m.id);
-  });
-});
+      if (error) throw error;
 
-document.addEventListener('keydown', e => {
-  if (e.key === 'Escape') {
-    document.querySelectorAll('.modal:not(.hidden)').forEach(m => {
-      hideModal(m.id);
+      isAdmin = data?.role === "admin";
+
+      if (isAdmin) {
+        console.log("VentureGate administrator authenticated.");
+      }
+
+    } catch (error) {
+      console.error("Admin verification error:", error);
+      isAdmin = false;
+    }
+
+    updateAdminInterface();
+  }
+
+  function updateAdminInterface() {
+    const box = $("#vgAdminInterface");
+    if (!box) return;
+
+    if (isAdmin && currentUser) {
+      box.innerHTML = `
+        <div class="vg-admin-status success">
+          <strong>Administrator access verified</strong><br>
+          <span class="vg-muted">
+            Signed in as ${escapeHTML(currentUser.email)}
+          </span>
+        </div>
+
+        <button type="button" id="vgLogout">
+          Sign out
+        </button>
+      `;
+
+      box.querySelector("#vgLogout").addEventListener(
+        "click",
+        logoutAdmin
+      );
+
+      const form = $("#filmForm");
+
+      if (form) {
+        form.style.display = "block";
+      }
+
+      renderAdminFilms();
+
+    } else {
+      box.innerHTML = `
+        <div class="vg-login-box">
+          <h3>Administrator login</h3>
+          <p class="vg-muted">
+            Sign in using your authorised VentureGate account.
+          </p>
+
+          <form id="vgLoginForm">
+            <input
+              type="email"
+              id="vgAdminEmail"
+              placeholder="Admin email address"
+              autocomplete="username"
+              required
+            >
+
+            <input
+              type="password"
+              id="vgAdminPassword"
+              placeholder="Password"
+              autocomplete="current-password"
+              required
+            >
+
+            <button type="submit" id="vgLoginButton">
+              Sign in
+            </button>
+          </form>
+
+          <p id="vgLoginMessage" class="vg-muted"></p>
+        </div>
+      `;
+
+      const form = $("#filmForm");
+
+      if (form) {
+        form.style.display = "none";
+      }
+
+      $("#vgLoginForm").addEventListener(
+        "submit",
+        loginAdmin
+      );
+    }
+  }
+
+  async function loginAdmin(event) {
+    event.preventDefault();
+
+    const email = $("#vgAdminEmail").value.trim();
+    const password = $("#vgAdminPassword").value;
+    const button = $("#vgLoginButton");
+    const message = $("#vgLoginMessage");
+
+    button.disabled = true;
+    button.textContent = "Signing in...";
+    message.textContent = "";
+
+    try {
+      const { data, error } = await db.auth.signInWithPassword({
+        email,
+        password
+      });
+
+      if (error) throw error;
+
+      await checkAdmin(data.user);
+
+      if (!isAdmin) {
+        await db.auth.signOut();
+
+        throw new Error(
+          "This account does not have administrator permissions."
+        );
+      }
+
+      showToast("Administrator login successful.");
+
+    } catch (error) {
+      console.error("Login error:", error);
+      message.textContent = error.message || "Login failed.";
+    } finally {
+      button.disabled = false;
+      button.textContent = "Sign in";
+    }
+  }
+
+  async function logoutAdmin() {
+    const { error } = await db.auth.signOut();
+
+    if (error) {
+      showToast("Unable to sign out.");
+      return;
+    }
+
+    currentUser = null;
+    isAdmin = false;
+
+    updateAdminInterface();
+    showToast("Signed out successfully.");
+  }
+
+  /* ============================================================
+     ADD FILMS
+     ============================================================ */
+
+  async function getOrCreateCategory(name) {
+    const cleanName = name.trim();
+
+    if (!cleanName) {
+      throw new Error("Please enter a film category.");
+    }
+
+    const existing = categories.find(
+      (category) =>
+        category.name.toLowerCase() === cleanName.toLowerCase()
+    );
+
+    if (existing) return existing.id;
+
+    const { data, error } = await db
+      .from("categories")
+      .insert({ name: cleanName })
+      .select("id,name")
+      .single();
+
+    if (error) throw error;
+
+    categories.push(data);
+
+    return data.id;
+  }
+
+  async function submitFilm(event) {
+    event.preventDefault();
+
+    if (!isAdmin || !currentUser) {
+      showToast("Administrator login required.");
+      return;
+    }
+
+    const form = event.currentTarget;
+    const button = form.querySelector('[type="submit"]');
+
+    const formData = new FormData(form);
+
+    const title = formData.get("title")?.toString().trim();
+    const category = formData.get("category")?.toString().trim();
+    const year = formData.get("year")?.toString().trim();
+    const runtime = formData.get("runtime")?.toString().trim();
+    const poster = formData.get("poster")?.toString().trim();
+    const video = formData.get("video")?.toString().trim();
+    const description = formData.get("description")?.toString().trim();
+
+    if (!title || !category || !video) {
+      showToast("Title, category and video link are required.");
+      return;
+    }
+
+    button.disabled = true;
+    button.textContent = "Publishing...";
+
+    try {
+      const categoryId = await getOrCreateCategory(category);
+
+      const newFilm = {
+        title,
+        description: description || "",
+        poster_url: poster || null,
+        video_url: normaliseVideoUrl(video),
+        category_id: categoryId,
+        release_year: year || null,
+        duration: runtime || null,
+        published: true
+      };
+
+      const { error } = await db
+        .from("films")
+        .insert(newFilm);
+
+      if (error) throw error;
+
+      form.reset();
+
+      await loadCatalogue();
+
+      showToast("Film published for everyone!");
+
+    } catch (error) {
+      console.error("Film upload error:", error);
+
+      showToast(
+        "Film could not be published: " + error.message
+      );
+
+    } finally {
+      button.disabled = false;
+      button.textContent = "Add Film";
+    }
+  }
+
+  /* ============================================================
+     ADMIN FILM MANAGEMENT
+     ============================================================ */
+
+  function renderAdminFilms() {
+    const list = $("#adminFilmList");
+
+    if (!list || !isAdmin) return;
+
+    list.innerHTML = "";
+
+    if (!films.length) {
+      list.innerHTML = `
+        <p class="vg-muted">
+          No published films yet. Add your first film above.
+        </p>
+      `;
+      return;
+    }
+
+    films.forEach((film) => {
+      const row = document.createElement("div");
+
+      row.className = "admin-row";
+
+      const details = document.createElement("div");
+
+      details.innerHTML = `
+        <strong>${escapeHTML(film.title)}</strong>
+        <br>
+        <span class="vg-muted">
+          ${escapeHTML(categoryName(film.category_id))}
+        </span>
+      `;
+
+      const actions = document.createElement("div");
+      actions.className = "vg-admin-actions";
+
+      const deleteButton = document.createElement("button");
+
+      deleteButton.className = "vg-delete-button";
+      deleteButton.textContent = "Delete";
+
+      deleteButton.addEventListener("click", () => {
+        deleteFilm(film.id, film.title);
+      });
+
+      actions.appendChild(deleteButton);
+
+      row.appendChild(details);
+      row.appendChild(actions);
+
+      list.appendChild(row);
     });
   }
-});
 
-/* FILTERS AND SEARCH */
+  async function deleteFilm(id, title) {
+    if (!isAdmin) {
+      showToast("Administrator access required.");
+      return;
+    }
 
-$('#filters').addEventListener('click', e => {
-  const b = e.target.closest('[data-filter]');
-  if (!b) return;
+    if (!confirm(`Are you sure you want to delete "${title}"?`)) {
+      return;
+    }
 
-  activeFilter = b.dataset.filter;
+    try {
+      const { error } = await db
+        .from("films")
+        .delete()
+        .eq("id", id);
 
-  document.querySelectorAll('.filter').forEach(x => {
-    x.classList.toggle('active', x === b);
+      if (error) throw error;
+
+      await loadCatalogue();
+
+      showToast("Film deleted.");
+
+    } catch (error) {
+      console.error("Delete error:", error);
+
+      showToast(
+        "Could not delete film: " + error.message
+      );
+    }
+  }
+
+  /* ============================================================
+     MEMBER / CHECKOUT BUTTONS
+     ============================================================ */
+
+  ["memberOpen", "memberOpen2", "checkoutBtn"].forEach((id) => {
+    const button = document.getElementById(id);
+
+    if (button) {
+      button.addEventListener("click", () => {
+        showToast("Membership options coming soon.");
+      });
+    }
   });
 
-  renderFilms();
-});
+  /* ============================================================
+     START
+     ============================================================ */
 
-document.querySelectorAll('[data-filter-link]').forEach(a => {
-  a.addEventListener('click', () => {
-    activeFilter = a.dataset.filterLink;
+  document.addEventListener("DOMContentLoaded", initialise);
 
-    document.querySelectorAll('.filter').forEach(x => {
-      x.classList.toggle('active', x.dataset.filter === activeFilter);
-    });
+  if (document.readyState !== "loading") {
+    initialise();
+  }
 
-    renderFilms();
-  });
-});
-
-$('#searchInput').addEventListener('input', renderFilms);
-
-$('#searchToggle').addEventListener('click', () => {
-  $('#searchInput').focus();
-  $('#films').scrollIntoView({behavior:'smooth'});
-});
-
-$('#viewAll').addEventListener('click', () => {
-  activeFilter = 'All';
-  $('#searchInput').value = '';
-
-  document.querySelectorAll('.filter').forEach(x => {
-    x.classList.toggle('active', x.dataset.filter === 'All');
-  });
-
-  renderFilms();
-});
-
-$('#heroPlay').addEventListener('click', () => {
-  $('#films').scrollIntoView({behavior:'smooth'});
-});
-
-/* MEMBERSHIP */
-
-$('#memberOpen').addEventListener('click', () => showModal('memberModal'));
-$('#memberOpen2').addEventListener('click', () => showModal('memberModal'));
-
-$('#checkoutBtn').addEventListener('click', () => {
-  toast('Payment checkout is not connected yet. The free catalogue remains open to everyone.');
-});
-
-/* ADMIN PANEL */
-
-$('#adminOpen').addEventListener('click', () => {
-  renderAdmin();
-  showModal('adminModal');
-});
-
-$('#filmForm').addEventListener('submit', e => {
-  e.preventDefault();
-
-  const d = new FormData(e.currentTarget);
-
-  const f = {
-    id:'vg-' + Date.now(),
-    title:d.get('title').trim(),
-    category:d.get('category'),
-    year:d.get('year') || '2026',
-    runtime:d.get('runtime') || 'Independent film',
-    poster:d.get('poster'),
-    video:d.get('video'),
-    description:d.get('description').trim(),
-    featured:d.get('featured') === 'on'
-  };
-
-  films.unshift(f);
-  saveFilms();
-
-  e.currentTarget.reset();
-
-  renderFilms();
-  renderAdmin();
-
-  toast('Film added to this browser’s library.');
-});
-
-function renderAdmin() {
-  $('#adminFilmList').innerHTML = films.map(f => `
-    <div class="admin-row">
-      <span>
-        ${esc(f.title)}
-        <small>· ${esc(f.category)}</small>
-      </span>
-      <button class="delete-btn" data-delete="${esc(f.id)}">REMOVE</button>
-    </div>
-  `).join('');
-
-  document.querySelectorAll('[data-delete]').forEach(b => {
-    b.addEventListener('click', () => {
-      films = films.filter(f => f.id !== b.dataset.delete);
-
-      saveFilms();
-      renderFilms();
-      renderAdmin();
-
-      toast('Film removed.');
-    });
-  });
-}
-
-/* START WEBSITE */
-
-renderFilms();
+})();
